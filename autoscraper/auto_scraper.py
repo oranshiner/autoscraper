@@ -1,7 +1,9 @@
 import hashlib
 import json
+import sqlite3
 from collections import defaultdict
 from html import unescape
+from typing import Dict, List, Optional, Union
 from urllib.parse import urljoin, urlparse
 
 import requests
@@ -87,10 +89,29 @@ class AutoScraper(object):
 
         # for backward compatibility
         if isinstance(data, list):
-            self.stack_list = data
+            self.stack_list = self._convert_content_to_tuples(data)
             return
 
-        self.stack_list = data["stack_list"]
+        self.stack_list = self._convert_content_to_tuples(data["stack_list"])
+
+    @staticmethod
+    def _convert_content_to_tuples(stack_list: List[Dict]) -> List[Dict]:
+        """
+        Convert content lists back to tuples after JSON deserialization.
+
+        JSON serialization converts tuples to lists, so we need to convert them back
+        for consistency with the internal format.
+
+        Args:
+            stack_list: List of stack dictionaries
+
+        Returns:
+            List of stack dictionaries with content as tuples
+        """
+        for stack in stack_list:
+            if "content" in stack and isinstance(stack["content"], list):
+                stack["content"] = [tuple(item) for item in stack["content"]]
+        return stack_list
 
     @classmethod
     def _fetch_html(cls, url, request_args=None):
