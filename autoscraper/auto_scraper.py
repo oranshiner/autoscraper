@@ -1,7 +1,9 @@
 import hashlib
 import json
+import sqlite3
 from collections import defaultdict
 from html import unescape
+from typing import Dict, List, Optional, Union
 from urllib.parse import urljoin, urlparse
 
 import requests
@@ -38,6 +40,8 @@ class AutoScraper(object):
     get_results() - Gets exact and similar results based on the previously learned rules.
     save() - Serializes the stack_list as JSON and saves it to disk.
     load() - De-serializes the JSON representation of the stack_list and loads it back.
+    save_to_db() - Saves the stack_list to a SQLite database.
+    load_from_db() - Loads the stack_list from a SQLite database.
     remove_rules() - Removes one or more learned rule[s] from the stack_list.
     keep_rules() - Keeps only the specified learned rules in the stack_list and removes the others.
     """
@@ -47,41 +51,34 @@ class AutoScraper(object):
             (KHTML, like Gecko) Chrome/84.0.4147.135 Safari/537.36"
     }
 
-    def __init__(self, stack_list=None):
+    def __init__(self, stack_list: Optional[List[Dict]] = None) -> None:
         self.stack_list = stack_list or []
 
-    def save(self, file_path):
+    def save(self, file_path: str) -> None:
         """
         Serializes the stack_list as JSON and saves it to the disk.
 
-        Parameters
-        ----------
-        file_path: str
-            Path of the JSON output
+        Args:
+            file_path: Path of the JSON output
 
-        Returns
-        -------
-        None
+        Raises:
+            IOError: If unable to write to the file
         """
-
         data = dict(stack_list=self.stack_list)
         with open(file_path, "w") as f:
             json.dump(data, f)
 
-    def load(self, file_path):
+    def load(self, file_path: str) -> None:
         """
         De-serializes the JSON representation of the stack_list and loads it back.
 
-        Parameters
-        ----------
-        file_path: str
-            Path of the JSON file to load stack_list from.
+        Args:
+            file_path: Path of the JSON file to load stack_list from
 
-        Returns
-        -------
-        None
+        Raises:
+            FileNotFoundError: If the file does not exist
+            json.JSONDecodeError: If the file contains invalid JSON
         """
-
         with open(file_path, "r") as f:
             data = json.load(f)
 
@@ -92,8 +89,133 @@ class AutoScraper(object):
 
         self.stack_list = data["stack_list"]
 
+    def save_to_db(self, db_path: str, table_name: str = "autoscraper_rules") -> None:
+        """
+        Saves the stack_list to a SQLite database.
+
+        Args:
+            db_path: Path to the SQLite database file. Will be created if it doesn't exist
+            table_name: Name of the database table to store the rules. Defaults to "autoscraper_rules"
+
+        Raises:
+            sqlite3.Error: If there's an error connecting to or writing to the database
+
+        Note:
+            The database schema stores each rule as a separate row with the following columns:
+            - id: Primary key (auto-increment)
+            - stack_id: Unique identifier for the rule
+            - rule_data: JSON representation of the complete rule
+            - created_at: Timestamp when the rule was saved
+        """
+        try:
+            conn = sqlite3.connect(db_path)
+            cursor = conn.cursor()
+
+            # Create table if it doesn't exist
+            cursor.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {table_name} (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    stack_id TEXT UNIQUE NOT NULL,
+                    rule_data TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+
+            # Clear existing rules for this table
+            cursor.execute(f"DELETE FROM {table_name}")
+
+            # Insert all rules from stack_list
+            for stack in self.stack_list:
+                stack_id = stack.get("stack_id", "")
+                rule_data = json.dumps(stack)
+                cursor.execute(
+                    f"""
+                    INSERT INTO {table_name} (stack_id, rule_data)
+                    VALUES (?, ?)
+                    """,
+                    (stack_id, rule_data),
+                )
+
+            conn.commit()
+            conn.close()
+
+        except sqlite3.Error as e:
+            raise sqlite3.Error(f"Error saving to database: {str(e)}")
+
+    def load_from_db(self, db_path: str, table_name: str = "autoscraper_rules") -> None:
+        """
+        Loads the stack_list from a SQLite database.
+
+        Args:
+            db_path: Path to the SQLite database file
+            table_name: Name of the database table to load the rules from. Defaults to "autoscraper_rules"
+
+        Raises:
+            sqlite3.Error: If there's an error connecting to or reading from the database
+            FileNotFoundError: If the database file doesn't exist
+            ValueError: If the rule data cannot be parsed
+
+        Note:
+            This method replaces the current stack_list with the rules loaded from the database.
+        """
+        try:
+            conn = sqlite3.connect(db_path)
+            cursor = conn.cursor()
+
+            # Check if table exists
+            cursor.execute(
+                """
+                SELECT name FROM sqlite_master
+                WHERE type='table' AND name=?
+                """,
+                (table_name,),
+            )
+
+            if not cursor.fetchone():
+                conn.close()
+                raise sqlite3.Error(
+                    f"Table '{table_name}' does not exist in the database"
+                )
+
+            # Load all rules from the table
+            cursor.execute(
+                f"SELECT rule_data FROM {table_name} ORDER BY id"
+            )
+
+            rows = cursor.fetchall()
+            conn.close()
+
+            # Parse JSON data and rebuild stack_list
+            self.stack_list = []
+            for row in rows:
+                rule_data = json.loads(row[0])
+                # Convert content lists back to tuples (JSON serialization converts tuples to lists)
+                if "content" in rule_data and isinstance(rule_data["content"], list):
+                    rule_data["content"] = [tuple(item) for item in rule_data["content"]]
+                self.stack_list.append(rule_data)
+
+        except sqlite3.Error as e:
+            raise sqlite3.Error(f"Error loading from database: {str(e)}")
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Error parsing rule data from database: {str(e)}")
+
     @classmethod
-    def _fetch_html(cls, url, request_args=None):
+    def _fetch_html(cls, url: str, request_args: Optional[Dict] = None) -> str:
+        """
+        Fetch HTML content from a URL.
+
+        Args:
+            url: URL to fetch
+            request_args: Additional request parameters for requests.get()
+
+        Returns:
+            HTML content as string
+
+        Raises:
+            requests.RequestException: If the HTTP request fails
+        """
         request_args = request_args or {}
         headers = dict(cls.request_headers)
         if url:
@@ -102,7 +224,7 @@ class AutoScraper(object):
         user_headers = request_args.pop("headers", {})
         headers.update(user_headers)
         res = requests.get(url, headers=headers, **request_args)
-        if res.encoding == "ISO-8859-1" and not "ISO-8859-1" in res.headers.get(
+        if res.encoding == "ISO-8859-1" and "ISO-8859-1" not in res.headers.get(
             "Content-Type", ""
         ):
             res.encoding = res.apparent_encoding
@@ -110,7 +232,23 @@ class AutoScraper(object):
         return html
 
     @classmethod
-    def _get_soup(cls, url=None, html=None, request_args=None):
+    def _get_soup(
+        cls, url: Optional[str] = None, html: Optional[str] = None, request_args: Optional[Dict] = None
+    ) -> BeautifulSoup:
+        """
+        Create a BeautifulSoup object from URL or HTML string.
+
+        Args:
+            url: URL to fetch HTML from
+            html: HTML string to parse
+            request_args: Additional request parameters for requests.get()
+
+        Returns:
+            BeautifulSoup object
+
+        Raises:
+            ValueError: If neither url nor html is provided
+        """
         if html:
             html = normalize(unescape(html))
             return BeautifulSoup(html, "lxml")
@@ -121,7 +259,16 @@ class AutoScraper(object):
         return BeautifulSoup(html, "lxml")
 
     @staticmethod
-    def _get_valid_attrs(item):
+    def _get_valid_attrs(item) -> Dict:
+        """
+        Extract valid attributes (class and style) from an HTML element.
+
+        Args:
+            item: BeautifulSoup element
+
+        Returns:
+            Dictionary containing class and style attributes
+        """
         key_attrs = {"class", "style"}
         attrs = {
             k: v if v != [] else "" for k, v in item.attrs.items() if k in key_attrs
@@ -133,7 +280,19 @@ class AutoScraper(object):
         return attrs
 
     @staticmethod
-    def _child_has_text(child, text, url, text_fuzz_ratio):
+    def _child_has_text(child, text: str, url: str, text_fuzz_ratio: float) -> bool:
+        """
+        Check if a child element contains the target text.
+
+        Args:
+            child: BeautifulSoup element
+            text: Target text to search for
+            url: Base URL for resolving relative URLs
+            text_fuzz_ratio: Similarity threshold for fuzzy matching
+
+        Returns:
+            True if the child contains the target text, False otherwise
+        """
         child_text = child.getText().strip()
 
         if text_match(text, child_text, text_fuzz_ratio):
@@ -167,7 +326,19 @@ class AutoScraper(object):
 
         return False
 
-    def _get_children(self, soup, text, url, text_fuzz_ratio):
+    def _get_children(self, soup: BeautifulSoup, text: str, url: str, text_fuzz_ratio: float) -> List:
+        """
+        Find all children elements containing the target text.
+
+        Args:
+            soup: BeautifulSoup object
+            text: Target text to search for
+            url: Base URL for resolving relative URLs
+            text_fuzz_ratio: Similarity threshold for fuzzy matching
+
+        Returns:
+            List of matching children elements
+        """
         children = reversed(soup.findChildren())
         children = [
             x for x in children if self._child_has_text(x, text, url, text_fuzz_ratio)
@@ -176,55 +347,45 @@ class AutoScraper(object):
 
     def build(
         self,
-        url=None,
-        wanted_list=None,
-        wanted_dict=None,
-        html=None,
-        request_args=None,
-        update=False,
-        text_fuzz_ratio=1.0,
-    ):
+        url: Optional[str] = None,
+        wanted_list: Optional[List] = None,
+        wanted_dict: Optional[Dict] = None,
+        html: Optional[str] = None,
+        request_args: Optional[Dict] = None,
+        update: bool = False,
+        text_fuzz_ratio: float = 1.0,
+    ) -> List[str]:
         """
         Automatically constructs a set of rules to scrape the specified target[s] from a web page.
-            The rules are represented as stack_list.
+        The rules are represented as stack_list.
 
-        Parameters:
-        ----------
-        url: str, optional
-            URL of the target web page. You should either pass url or html or both.
-
-        wanted_list: list of strings or compiled regular expressions, optional
-            A list of needed contents to be scraped.
-                AutoScraper learns a set of rules to scrape these targets. If specified,
-                wanted_dict will be ignored.
-
-        wanted_dict: dict, optional
-            A dict of needed contents to be scraped. Keys are aliases and values are list of target texts
-                or compiled regular expressions.
-                AutoScraper learns a set of rules to scrape these targets and sets its aliases.
-
-        html: str, optional
-            An HTML string can also be passed instead of URL.
-                You should either pass url or html or both.
-
-        request_args: dict, optional
-            A dictionary used to specify a set of additional request parameters used by requests
-                module. You can specify proxy URLs, custom headers etc.
-
-        update: bool, optional, defaults to False
-            If True, new learned rules will be added to the previous ones.
-            If False, all previously learned rules will be removed.
-
-        text_fuzz_ratio: float in range [0, 1], optional, defaults to 1.0
-            The fuzziness ratio threshold for matching the wanted contents.
+        Args:
+            url: URL of the target web page. You should either pass url or html or both
+            wanted_list: A list of needed contents to be scraped. AutoScraper learns a set of
+                rules to scrape these targets. If specified, wanted_dict will be ignored
+            wanted_dict: A dict of needed contents to be scraped. Keys are aliases and values
+                are list of target texts or compiled regular expressions. AutoScraper learns
+                a set of rules to scrape these targets and sets its aliases
+            html: An HTML string can also be passed instead of URL. You should either pass
+                url or html or both
+            request_args: A dictionary used to specify a set of additional request parameters
+                used by requests module. You can specify proxy URLs, custom headers etc
+            update: If True, new learned rules will be added to the previous ones. If False,
+                all previously learned rules will be removed. Defaults to False
+            text_fuzz_ratio: The fuzziness ratio threshold for matching the wanted contents.
+                Must be in range [0, 1]. Defaults to 1.0
 
         Returns:
-        --------
-        List of similar results
-        """
+            List of similar results
 
+        Raises:
+            ValueError: If no targets are supplied or if text_fuzz_ratio is out of range
+        """
         if not wanted_list and not (wanted_dict and any(wanted_dict.values())):
             raise ValueError("No targets were supplied")
+
+        if not 0 <= text_fuzz_ratio <= 1:
+            raise ValueError("text_fuzz_ratio must be between 0 and 1")
 
         soup = self._get_soup(url=url, html=html, request_args=request_args)
 
@@ -258,7 +419,17 @@ class AutoScraper(object):
         return result_list
 
     @classmethod
-    def _build_stack(cls, child, url):
+    def _build_stack(cls, child, url: str) -> Dict:
+        """
+        Build a stack (rule) from a child element by traversing up the DOM tree.
+
+        Args:
+            child: BeautifulSoup element
+            url: Base URL for the page
+
+        Returns:
+            Dictionary representing the stack/rule with content path, attributes, and metadata
+        """
         content = [(child.name, cls._get_valid_attrs(child))]
 
         parent = child
@@ -302,7 +473,22 @@ class AutoScraper(object):
         return result, stack
 
     @staticmethod
-    def _fetch_result_from_child(child, wanted_attr, is_full_url, url, is_non_rec_text):
+    def _fetch_result_from_child(
+        child, wanted_attr: Optional[str], is_full_url: bool, url: str, is_non_rec_text: bool
+    ) -> Optional[str]:
+        """
+        Extract the target content from a child element.
+
+        Args:
+            child: BeautifulSoup element
+            wanted_attr: Attribute name to extract, or None for text content
+            is_full_url: Whether to convert relative URLs to absolute
+            url: Base URL for resolving relative URLs
+            is_non_rec_text: Whether to extract only non-recursive text
+
+        Returns:
+            Extracted content as string, or None if attribute not found
+        """
         if wanted_attr is None:
             if is_non_rec_text:
                 return get_non_rec_text(child)
@@ -317,7 +503,17 @@ class AutoScraper(object):
         return child.attrs[wanted_attr]
 
     @staticmethod
-    def _get_fuzzy_attrs(attrs, attr_fuzz_ratio):
+    def _get_fuzzy_attrs(attrs: Dict, attr_fuzz_ratio: float) -> Dict:
+        """
+        Convert attribute values to FuzzyText for fuzzy matching.
+
+        Args:
+            attrs: Dictionary of HTML attributes
+            attr_fuzz_ratio: Similarity threshold for fuzzy matching
+
+        Returns:
+            Dictionary with FuzzyText values for fuzzy matching
+        """
         attrs = dict(attrs)
         for key, val in attrs.items():
             if isinstance(val, str) and val:
