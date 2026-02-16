@@ -7,6 +7,8 @@ from urllib.parse import urljoin, urlparse
 import requests
 from bs4 import BeautifulSoup
 
+
+#test בלה בלה 12ק3
 from autoscraper.utils import (
     FuzzyText,
     ResultItem,
