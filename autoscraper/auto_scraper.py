@@ -68,29 +68,6 @@ class AutoScraper(object):
         with open(file_path, "w") as f:
             json.dump(data, f)
 
-    def load(self, file_path):
-        """
-        De-serializes the JSON representation of the stack_list and loads it back.
-
-        Parameters
-        ----------
-        file_path: str
-            Path of the JSON file to load stack_list from.
-
-        Returns
-        -------
-        None
-        """
-
-        with open(file_path, "r") as f:
-            data = json.load(f)
-
-        # for backward compatibility
-        if isinstance(data, list):
-            self.stack_list = data
-            return
-
-        self.stack_list = data["stack_list"]
 
     @classmethod
     def _fetch_html(cls, url, request_args=None):
